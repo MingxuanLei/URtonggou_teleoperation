@@ -2,7 +2,7 @@
 UR5e 同构遥操作、示教记录与示教回放的控制逻辑模块。
 
 本文件只负责设备通信、主端电机控制、UR5e RTDE、夹爪控制、遥操作、
-示教记录和示教回放，不创建 GUI。界面由 GUI_takeover_v2.py 提供。
+示教记录和示教回放，不创建 GUI。界面由 GUI_takeover_stable.py 提供。
 
 功能：
 1. 主端 UR 同构小机械臂 1~6 轴 PV 准备对齐、MIT 重力补偿遥操作。
@@ -24,6 +24,7 @@ import time
 import threading
 from typing import List, Optional, Sequence, Tuple
 from enum import Enum
+from collections import deque
 
 # zlgcan.py 在 Windows 下使用 ./zlgcan.dll，确保工作目录为脚本所在目录。
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -154,65 +155,77 @@ REPLAY_MASTER_ALIGN_STABLE_S = 0.40
 REPLAY_MASTER_ALIGN_TIMEOUT_S = 40.0
 
 # 主端在回放期间使用 MIT 位置跟随 + 重力补偿前馈。
-# 之前 Kp=4 对真实主端偏软；这里提高到仍较保守的起始值。
-# 首次测试仍应小范围、慢速回放，如有振荡应立即降低 Kp/Kd。
-REPLAY_MASTER_KP_DEFAULT = 5.0
+# 采用逐关节柔顺参数：靠近末端的关节明显更软，更容易被操作者人工介入。
+# GUI 中的 Kp/Kd 仍作为 J1/J2 的“基准值”，其余关节按下面的默认比例缩放。
+REPLAY_MASTER_KP_DEFAULT = 8.0
 REPLAY_MASTER_KD_DEFAULT = 0.30
-REPLAY_TOOL_KP_DEFAULT = 4.0
-REPLAY_TOOL_KD_DEFAULT = 0.30
+REPLAY_MASTER_KP_PROFILE_DEFAULT = np.asarray([8.0, 8.0, 7.0, 4.0, 3.5, 3.0], dtype=float)
+REPLAY_MASTER_KD_PROFILE_DEFAULT = np.asarray([0.30, 0.30, 0.25, 0.15, 0.12, 0.10], dtype=float)
+REPLAY_TOOL_KP_DEFAULT = 2.0
+REPLAY_TOOL_KD_DEFAULT = 0.10
 REPLAY_MAX_FOLLOW_STEP = 0.20
 
-# 示教回放期间的人工介入检测。
-#
-# 检测采用 7 维联合判断：J1~J6 + M7。
-# 三条独立通道中任一通道持续满足即可触发 TAKEOVER：
-#   1) FAST：快速、短促的人手推动；
-#   2) OPPOSITE：实际运动方向与回放参考明显相反；
-#   3) SLOW：较慢但持续地把主端主动拖离参考轨迹。
-#
-# 关键点：SLOW 不再用“err * relative_velocity > 0”作为唯一证据，
-# 而使用“err * actual_velocity > 0”，即必须是主端自身实际运动在主动
-# 扩大误差。这样参考轨迹自己跑得较快造成的正常跟随滞后不会轻易触发。
+# =========================
+# 独立人工介入检测器（200 Hz）
+# =========================
+# 回放线程仍负责 UR5e / 夹爪 / MIT 参考目标；Detector 只负责“人有没有动主端”。
+# J1~J6 直接使用达妙电机 Velocity / Robot.ratio；M7 直接使用 tool.Velocity。
 TAKEOVER_ENABLED_DEFAULT = True
+TAKEOVER_DETECT_HZ = 200.0
 
-# 武装阶段。
-TAKEOVER_ARM_STABLE_TIME_S = 0.20
+# 参考速度不再使用相邻两帧直接差分：
+# 使用约5个记录周期的窗口求平均速度，再做低通；若速度明显不合理，则本周期禁止介入判定。
+TAKEOVER_REF_VEL_WINDOW_FRAMES = 5
+TAKEOVER_REF_VEL_MIN_DT_S = 0.020
+TAKEOVER_REF_VEL_ALPHA = 0.25
+TAKEOVER_REF_VEL_SANITY_MAX_RAD_S = 2.0
+TAKEOVER_TOOL_REF_VEL_SANITY_MAX_RAD_S = 2.0
+
+# 武装：自动跟随先稳定一小段时间，避免刚从 PV 切 MIT 的瞬态误触发。
+TAKEOVER_ARM_STABLE_TIME_S = 0.30
 TAKEOVER_ARM_ERROR_RAD = 0.08
 TAKEOVER_TOOL_ARM_ERROR_RAD = 0.10
 
-# SLOW：慢速持续介入（J1~J6）。
-TAKEOVER_BASE_ERROR_RAD = 0.06
+# SLOW：较慢但持续地由主端自身运动把误差扩大。
+TAKEOVER_BASE_ERROR_RAD = 0.075
 TAKEOVER_SPEED_GAIN_S = 0.12
-TAKEOVER_MAX_ERROR_RAD = 0.15
+TAKEOVER_MAX_ERROR_RAD = 0.18
 TAKEOVER_MIN_ACTUAL_VEL_RAD_S = 0.04
-TAKEOVER_PERSIST_S = 0.08
-
-# SLOW：M7 单独阈值。
-TAKEOVER_TOOL_BASE_ERROR_RAD = 0.05
+TAKEOVER_PERSIST_S = 0.12
+TAKEOVER_TOOL_BASE_ERROR_RAD = 0.060
 TAKEOVER_TOOL_SPEED_GAIN_S = 0.10
-TAKEOVER_TOOL_MAX_ERROR_RAD = 0.12
+TAKEOVER_TOOL_MAX_ERROR_RAD = 0.14
 TAKEOVER_TOOL_MIN_ACTUAL_VEL_RAD_S = 0.04
 
-# FAST：快速强介入。要求“实际主端速度”本身足够大，避免回放参考
-# 突然变化而主端暂时滞后时产生误判。
-TAKEOVER_FAST_ERROR_RAD = 0.04
+# FAST：快速短促推动。除了误差/速度门槛，还要求误差正在扩大，
+# 并且主端是反向运动或明显比参考运动得更快，正常“落后后追赶”不会触发。
+TAKEOVER_FAST_ERROR_RAD = 0.040
 TAKEOVER_FAST_ACTUAL_VEL_RAD_S = 0.35
-TAKEOVER_FAST_REL_VEL_RAD_S = 0.30
-TAKEOVER_FAST_PERSIST_S = 0.03
+TAKEOVER_FAST_REL_VEL_RAD_S = 0.25
+TAKEOVER_FAST_EXCESS_VEL_RAD_S = 0.25
+TAKEOVER_FAST_PERSIST_S = 0.040
+TAKEOVER_TOOL_FAST_ERROR_RAD = 0.030
+TAKEOVER_TOOL_FAST_ACTUAL_VEL_RAD_S = 0.24
+TAKEOVER_TOOL_FAST_REL_VEL_RAD_S = 0.18
+TAKEOVER_TOOL_FAST_EXCESS_VEL_RAD_S = 0.18
 
-TAKEOVER_TOOL_FAST_ERROR_RAD = 0.03
-TAKEOVER_TOOL_FAST_ACTUAL_VEL_RAD_S = 0.25
-TAKEOVER_TOOL_FAST_REL_VEL_RAD_S = 0.22
-
-# OPPOSITE：主端明显朝回放参考的反方向运动。
-TAKEOVER_OPPOSITE_ERROR_RAD = 0.03
-TAKEOVER_OPPOSITE_ACTUAL_VEL_RAD_S = 0.18
-TAKEOVER_OPPOSITE_REF_VEL_RAD_S = 0.04
-TAKEOVER_OPPOSITE_PERSIST_S = 0.03
-
+# OPPOSITE：实际运动方向与回放参考方向相反。
+TAKEOVER_OPPOSITE_ERROR_RAD = 0.035
+TAKEOVER_OPPOSITE_ACTUAL_VEL_RAD_S = 0.25
+TAKEOVER_OPPOSITE_REF_VEL_RAD_S = 0.060
+TAKEOVER_OPPOSITE_PERSIST_S = 0.040
 TAKEOVER_TOOL_OPPOSITE_ERROR_RAD = 0.025
-TAKEOVER_TOOL_OPPOSITE_ACTUAL_VEL_RAD_S = 0.14
-TAKEOVER_TOOL_OPPOSITE_REF_VEL_RAD_S = 0.03
+TAKEOVER_TOOL_OPPOSITE_ACTUAL_VEL_RAD_S = 0.18
+TAKEOVER_TOOL_OPPOSITE_REF_VEL_RAD_S = 0.045
+
+# STATIONARY_PUSH：参考轨迹几乎静止，但主端突然明显运动。
+TAKEOVER_STATIONARY_REF_VEL_RAD_S = 0.050
+TAKEOVER_STATIONARY_ACTUAL_VEL_RAD_S = 0.28
+TAKEOVER_STATIONARY_ERROR_RAD = 0.030
+TAKEOVER_STATIONARY_PERSIST_S = 0.040
+TAKEOVER_TOOL_STATIONARY_REF_VEL_RAD_S = 0.040
+TAKEOVER_TOOL_STATIONARY_ACTUAL_VEL_RAD_S = 0.20
+TAKEOVER_TOOL_STATIONARY_ERROR_RAD = 0.022
 
 
 class ControlMode(Enum):
@@ -492,6 +505,31 @@ class MasterArmController(QObject):
             self.log(f"[WARN] 读取第7号工具电机位置失败: {e}")
             return None
 
+    def get_dh_velocity(self) -> Optional[List[float]]:
+        """直接使用达妙电机速度反馈换算 DH 关节速度，供 200 Hz 接管检测。"""
+        if not self.initialized or self.can is None or self.robot is None:
+            return None
+        try:
+            with self.data_lock:
+                motor_vel = np.asarray([float(m.Velocity) for m in self.can.motors], dtype=float)
+                ratio = np.asarray(self.robot.ratio, dtype=float).reshape(ARM_DOF)
+                ratio = np.where(np.abs(ratio) < 1.0e-12, 1.0, ratio)
+                return [float(x) for x in (motor_vel / ratio)]
+        except Exception as e:
+            self.log(f"[WARN] 读取主端DH速度失败: {e}")
+            return None
+
+    def get_tool_velocity(self) -> Optional[float]:
+        """直接读取第7号达妙工具电机速度反馈。"""
+        if not self.initialized or self.can is None or not self.can.tools:
+            return None
+        try:
+            with self.data_lock:
+                return float(self.can.tools[0].Velocity)
+        except Exception as e:
+            self.log(f"[WARN] 读取第7号工具电机速度失败: {e}")
+            return None
+
     def get_motor_snapshot(self) -> Optional[List[dict]]:
         if not self.initialized or self.can is None:
             return None
@@ -653,6 +691,11 @@ class MasterArmController(QObject):
 
             kp = max(0.0, min(500.0, float(kp)))
             kd = max(0.0, min(5.0, float(kd)))
+            # GUI 参数作为 J1/J2 基准值，其余关节保持柔顺比例。
+            kp_scale = kp / max(float(REPLAY_MASTER_KP_DEFAULT), 1.0e-9)
+            kd_scale = kd / max(float(REPLAY_MASTER_KD_DEFAULT), 1.0e-9)
+            kp_profile = np.clip(REPLAY_MASTER_KP_PROFILE_DEFAULT * kp_scale, 0.0, 500.0)
+            kd_profile = np.clip(REPLAY_MASTER_KD_PROFILE_DEFAULT * kd_scale, 0.0, 5.0)
             tool_kp = max(0.0, min(500.0, float(tool_kp)))
             tool_kd = max(0.0, min(5.0, float(tool_kd)))
 
@@ -666,8 +709,8 @@ class MasterArmController(QObject):
             with self.data_lock:
                 self.mit_follow_motor_targets = motor_targets
                 self.mit_follow_tool_target = tool_target
-                self.mit_follow_kp = kp
-                self.mit_follow_kd = kd
+                self.mit_follow_kp = kp_profile.copy()
+                self.mit_follow_kd = kd_profile.copy()
                 self.mit_follow_tool_kp = tool_kp
                 self.mit_follow_tool_kd = tool_kd
                 self.mit_follow_enabled = True
@@ -677,8 +720,9 @@ class MasterArmController(QObject):
                 return False
 
             self.log(
-                "[MIT FOLLOW] 已启用主端MIT跟随："
-                f"Kp={kp:.2f}, Kd={kd:.2f}, "
+                "[MIT FOLLOW] 已启用逐关节柔顺MIT跟随："
+                f"Kp={[round(float(x),2) for x in kp_profile]}, "
+                f"Kd={[round(float(x),2) for x in kd_profile]}, "
                 f"ToolKp={tool_kp:.2f}, ToolKd={tool_kd:.2f}"
             )
             return True
@@ -742,8 +786,10 @@ class MasterArmController(QObject):
                                 self.mit_follow_motor_targets[i]
                             )
                             motor.MIT.velocity_set = 0.0
-                            motor.MIT.kp_set = float(self.mit_follow_kp)
-                            motor.MIT.kd_set = float(self.mit_follow_kd)
+                            kp_arr = np.asarray(self.mit_follow_kp, dtype=float).reshape(-1)
+                            kd_arr = np.asarray(self.mit_follow_kd, dtype=float).reshape(-1)
+                            motor.MIT.kp_set = float(kp_arr[i] if kp_arr.size > 1 else kp_arr[0])
+                            motor.MIT.kd_set = float(kd_arr[i] if kd_arr.size > 1 else kd_arr[0])
                         else:
                             motor.MIT.position_set = 0.0
                             motor.MIT.velocity_set = 0.0
@@ -1142,6 +1188,19 @@ class TeleopCoordinator(QObject):
         self.takeover_triggered = False
         self.takeover_last_reason = ""
 
+        # 独立 200 Hz 人工接管检测器共享状态。
+        self.takeover_detector_stop_event = threading.Event()
+        self.takeover_detector_thread: Optional[threading.Thread] = None
+        self.takeover_ref_lock = threading.RLock()
+        self.takeover_ref_master: Optional[np.ndarray] = None
+        self.takeover_ref_tool: Optional[float] = None
+        # Replay 线程直接提供参考速度，避免 200Hz Detector 对 125Hz
+        # 阶梯位置参考做差分而产生“假高速/假静止”。
+        self.takeover_ref_master_vel = np.zeros(ARM_DOF, dtype=float)
+        self.takeover_ref_tool_vel = 0.0
+        self.takeover_ref_vel_valid = False
+        self.takeover_ref_vel_max_abs = 0.0
+
     def log(self, msg: str):
         self.log_signal.emit(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
@@ -1368,6 +1427,239 @@ class TeleopCoordinator(QObject):
                 f"0rad=闭合，1rad=张开，启动开度={initial_opening:.3f}"
             )
             return True
+
+    def _update_takeover_reference(
+        self,
+        master_ref: Sequence[float],
+        tool_ref: float,
+        master_ref_vel: Optional[Sequence[float]] = None,
+        tool_ref_vel: float = 0.0,
+        ref_vel_valid: bool = True,
+    ):
+        """
+        由 Replay 线程更新 Detector 的共享参考。
+
+        位置和速度都由 Replay 时间轴直接提供。Detector 不再自行对 125Hz
+        阶梯位置参考求差分，从而避免把正常自动跟随误判成 FAST 或
+        STATIONARY_PUSH。
+        """
+        with self.takeover_ref_lock:
+            self.takeover_ref_master = np.asarray(
+                master_ref, dtype=float
+            ).reshape(ARM_DOF).copy()
+            self.takeover_ref_tool = float(tool_ref)
+            if master_ref_vel is None:
+                self.takeover_ref_master_vel = np.zeros(ARM_DOF, dtype=float)
+            else:
+                self.takeover_ref_master_vel = np.asarray(
+                    master_ref_vel, dtype=float
+                ).reshape(ARM_DOF).copy()
+            self.takeover_ref_tool_vel = float(tool_ref_vel)
+            self.takeover_ref_vel_valid = bool(ref_vel_valid)
+            arm_max = float(np.max(np.abs(self.takeover_ref_master_vel))) if self.takeover_ref_master_vel.size else 0.0
+            self.takeover_ref_vel_max_abs = max(arm_max, abs(self.takeover_ref_tool_vel))
+
+    def _stop_takeover_detector(self):
+        self.takeover_detector_stop_event.set()
+        th = self.takeover_detector_thread
+        if th is not None and th.is_alive() and th is not threading.current_thread():
+            th.join(timeout=0.8)
+        self.takeover_detector_thread = None
+
+    def _start_takeover_detector(self):
+        """独立 200 Hz 检测 J1~J6 + M7，直接使用达妙 Velocity 反馈。"""
+        self._stop_takeover_detector()
+        if not self.takeover_enabled:
+            return
+        self.takeover_detector_stop_event.clear()
+        self.takeover_armed = False
+
+        def worker():
+            period = 1.0 / max(float(TAKEOVER_DETECT_HZ), 1.0)
+            stable_since = fast_since = opposite_since = stationary_since = slow_since = None
+            last_diag = 0.0
+            last_ref_warn = 0.0
+            self.log(
+                f"[TAKEOVER] 独立检测线程启动：{TAKEOVER_DETECT_HZ:.0f}Hz，"
+                "直接使用达妙Velocity；FAST/OPPOSITE/STATIONARY_PUSH/SLOW 四通道"
+            )
+            try:
+                while not self.takeover_detector_stop_event.is_set():
+                    loop_t = time.perf_counter()
+                    if self.replay_stop_event.is_set() or self.takeover_event.is_set():
+                        break
+                    with self.control_lock:
+                        if self.control_mode is not ControlMode.REPLAY:
+                            break
+                    with self.takeover_ref_lock:
+                        ref6 = (
+                            None
+                            if self.takeover_ref_master is None
+                            else self.takeover_ref_master.copy()
+                        )
+                        ref7 = self.takeover_ref_tool
+                        refv6 = self.takeover_ref_master_vel.copy()
+                        refv7 = float(self.takeover_ref_tool_vel)
+                        ref_vel_valid = bool(self.takeover_ref_vel_valid)
+                        ref_vel_max_abs = float(self.takeover_ref_vel_max_abs)
+                    if ref6 is None or ref7 is None:
+                        time.sleep(period)
+                        continue
+
+                    q6 = self.master.get_dh_q()
+                    q7 = self.master.get_tool_position()
+                    v6 = self.master.get_dh_velocity()
+                    v7 = self.master.get_tool_velocity()
+                    if q6 is None or q7 is None or v6 is None or v7 is None:
+                        time.sleep(period)
+                        continue
+
+                    now = time.perf_counter()
+
+                    actual6 = np.asarray(q6, dtype=float)
+                    actualv6 = np.asarray(v6, dtype=float)
+                    err6 = np.asarray(
+                        [
+                            Robot.minor_arc_dir(float(r), float(a))
+                            for r, a in zip(ref6, actual6)
+                        ],
+                        dtype=float,
+                    )
+                    err7 = float(q7) - float(ref7)
+                    err = np.concatenate([err6, [err7]])
+                    actualv = np.concatenate([actualv6, [float(v7)]])
+                    refv = np.concatenate([
+                        np.asarray(refv6, dtype=float).reshape(ARM_DOF),
+                        [float(refv7)],
+                    ])
+                    relv = actualv - refv
+                    abserr = np.abs(err)
+
+                    if not self.takeover_armed:
+                        if float(np.max(abserr[:ARM_DOF])) <= TAKEOVER_ARM_ERROR_RAD and abserr[ARM_DOF] <= TAKEOVER_TOOL_ARM_ERROR_RAD:
+                            if stable_since is None: stable_since = now
+                            elif now - stable_since >= TAKEOVER_ARM_STABLE_TIME_S:
+                                self.takeover_armed = True
+                                fast_since = opposite_since = stationary_since = slow_since = None
+                                self.log(f"[TAKEOVER] 人工介入检测已武装：稳定{TAKEOVER_ARM_STABLE_TIME_S:.2f}s，J1~J6 + M7")
+                        else:
+                            stable_since = None
+                    else:
+                        # 参考速度窗口尚未建立，或Replay检测到时间戳/速度异常时，
+                        # 本周期不允许触发人工接管。这样异常 ref_vel 不会放大 rel_vel。
+                        if not ref_vel_valid:
+                            fast_since = opposite_since = stationary_since = slow_since = None
+                            if now - last_ref_warn >= 1.0:
+                                last_ref_warn = now
+                                self.log(
+                                    f"[TAKEOVER] 参考速度暂不可用/异常(max={ref_vel_max_abs:.3f}rad/s)，"
+                                    "本周期跳过人工介入判定"
+                                )
+                            elapsed = time.perf_counter() - loop_t
+                            time.sleep(max(0.0, period - elapsed))
+                            continue
+
+                        base = np.asarray([TAKEOVER_BASE_ERROR_RAD]*ARM_DOF + [TAKEOVER_TOOL_BASE_ERROR_RAD])
+                        gain = np.asarray([TAKEOVER_SPEED_GAIN_S]*ARM_DOF + [TAKEOVER_TOOL_SPEED_GAIN_S])
+                        mx = np.asarray([TAKEOVER_MAX_ERROR_RAD]*ARM_DOF + [TAKEOVER_TOOL_MAX_ERROR_RAD])
+                        minv = np.asarray([TAKEOVER_MIN_ACTUAL_VEL_RAD_S]*ARM_DOF + [TAKEOVER_TOOL_MIN_ACTUAL_VEL_RAD_S])
+                        dynamic = np.minimum(mx, base + gain*np.abs(refv))
+
+                        # err = q_master - q_ref，relv = v_master - v_ref = d(err)/dt。
+                        # err*relv > 0：误差幅值正在扩大；<0：主端正在追赶参考。
+                        diverging = (err * relv) > 0.0
+                        worsening = diverging & (np.abs(actualv) >= minv)
+
+                        fast_err = np.asarray([TAKEOVER_FAST_ERROR_RAD]*ARM_DOF + [TAKEOVER_TOOL_FAST_ERROR_RAD])
+                        fast_av = np.asarray([TAKEOVER_FAST_ACTUAL_VEL_RAD_S]*ARM_DOF + [TAKEOVER_TOOL_FAST_ACTUAL_VEL_RAD_S])
+                        fast_rv = np.asarray([TAKEOVER_FAST_REL_VEL_RAD_S]*ARM_DOF + [TAKEOVER_TOOL_FAST_REL_VEL_RAD_S])
+                        fast_excess = np.asarray([TAKEOVER_FAST_EXCESS_VEL_RAD_S]*ARM_DOF + [TAKEOVER_TOOL_FAST_EXCESS_VEL_RAD_S])
+
+                        # FAST 只允许两类明显主动动作：
+                        # 1) 与参考运动方向相反；
+                        # 2) 与参考同方向，但主端速度明显超过参考速度。
+                        fast_opposite = (actualv * refv) < 0.0
+                        fast_overspeed = np.abs(actualv) >= (np.abs(refv) + fast_excess)
+                        fast_mask = (
+                            (abserr >= fast_err)
+                            & (np.abs(actualv) >= fast_av)
+                            & (np.abs(relv) >= fast_rv)
+                            & diverging
+                            & (fast_opposite | fast_overspeed)
+                        )
+
+                        opp_err = np.asarray([TAKEOVER_OPPOSITE_ERROR_RAD]*ARM_DOF + [TAKEOVER_TOOL_OPPOSITE_ERROR_RAD])
+                        opp_av = np.asarray([TAKEOVER_OPPOSITE_ACTUAL_VEL_RAD_S]*ARM_DOF + [TAKEOVER_TOOL_OPPOSITE_ACTUAL_VEL_RAD_S])
+                        opp_rv = np.asarray([TAKEOVER_OPPOSITE_REF_VEL_RAD_S]*ARM_DOF + [TAKEOVER_TOOL_OPPOSITE_REF_VEL_RAD_S])
+                        opposite_mask = (
+                            (abserr >= opp_err)
+                            & ((actualv * refv) < 0.0)
+                            & (np.abs(actualv) >= opp_av)
+                            & (np.abs(refv) >= opp_rv)
+                            & diverging
+                        )
+
+                        stat_ref = np.asarray([TAKEOVER_STATIONARY_REF_VEL_RAD_S]*ARM_DOF + [TAKEOVER_TOOL_STATIONARY_REF_VEL_RAD_S])
+                        stat_av = np.asarray([TAKEOVER_STATIONARY_ACTUAL_VEL_RAD_S]*ARM_DOF + [TAKEOVER_TOOL_STATIONARY_ACTUAL_VEL_RAD_S])
+                        stat_err = np.asarray([TAKEOVER_STATIONARY_ERROR_RAD]*ARM_DOF + [TAKEOVER_TOOL_STATIONARY_ERROR_RAD])
+                        stationary_mask = (
+                            (np.abs(refv) <= stat_ref)
+                            & (np.abs(actualv) >= stat_av)
+                            & (abserr >= stat_err)
+                            & diverging
+                        )
+                        slow_mask = (abserr >= dynamic) & worsening
+
+                        trigger_kind = None; trigger_mask = None
+                        def persist(mask, since, need):
+                            if bool(np.any(mask)):
+                                if since is None: return now, False
+                                return since, (now-since >= need)
+                            return None, False
+                        fast_since, hit = persist(fast_mask, fast_since, TAKEOVER_FAST_PERSIST_S)
+                        if hit: trigger_kind, trigger_mask = 'FAST', fast_mask
+                        if trigger_kind is None:
+                            opposite_since, hit = persist(opposite_mask, opposite_since, TAKEOVER_OPPOSITE_PERSIST_S)
+                            if hit: trigger_kind, trigger_mask = 'OPPOSITE', opposite_mask
+                        if trigger_kind is None:
+                            stationary_since, hit = persist(stationary_mask, stationary_since, TAKEOVER_STATIONARY_PERSIST_S)
+                            if hit: trigger_kind, trigger_mask = 'STATIONARY_PUSH', stationary_mask
+                        if trigger_kind is None:
+                            slow_since, hit = persist(slow_mask, slow_since, TAKEOVER_PERSIST_S)
+                            if hit: trigger_kind, trigger_mask = 'SLOW', slow_mask
+
+                        if trigger_kind is not None:
+                            axes = np.where(trigger_mask)[0]
+                            axis = int(axes[np.argmax(abserr[axes])])
+                            name = f"J{axis+1}" if axis < ARM_DOF else 'M7'
+                            self.takeover_last_reason = (
+                                f"{trigger_kind} {name}: err={err[axis]:.3f}rad, "
+                                f"actual_vel={actualv[axis]:.3f}rad/s, ref_vel={refv[axis]:.3f}rad/s, "
+                                f"rel_vel={relv[axis]:.3f}rad/s"
+                            )
+                            self.takeover_triggered = True
+                            self.takeover_event.set()
+                            self._set_control_mode(ControlMode.TAKEOVER)
+                            self.log('[TAKEOVER] 检测到人工介入：' + self.takeover_last_reason)
+                            break
+
+                        if now - last_diag >= 0.75:
+                            last_diag = now
+                            self.log(
+                                f"[TAKEOVER] ARMED | arm_err={float(np.max(abserr[:ARM_DOF])):.3f}rad | "
+                                f"M7_err={abserr[ARM_DOF]:.3f}rad | max|v|={float(np.max(np.abs(actualv))):.3f}rad/s | "
+                                f"max|ref_v|={float(np.max(np.abs(refv))):.3f}rad/s"
+                            )
+
+                    elapsed = time.perf_counter() - loop_t
+                    time.sleep(max(0.0, period - elapsed))
+            except Exception as e:
+                self.log(f"[WARN] 人工介入检测线程异常: {e}")
+            finally:
+                self.log('[TAKEOVER] 独立人工介入检测线程退出')
+
+        self.takeover_detector_thread = threading.Thread(target=worker, name='takeover_detector_200hz', daemon=True)
+        self.takeover_detector_thread.start()
 
     @staticmethod
     def _master_absolute_to_ur_nearest(
@@ -2217,7 +2509,7 @@ class TeleopCoordinator(QObject):
             if self.takeover_enabled:
                 self.log(
                     "[TAKEOVER] 7轴检测已启用：J1~J6 + M7，"
-                    "FAST/OPPOSITE/SLOW 三通道并行"
+                    "FAST/OPPOSITE/STATIONARY_PUSH/SLOW 四通道并行"
                 )
 
             # 为避免 ±pi 包络导致主端MIT目标突然跳约2pi，
@@ -2231,24 +2523,20 @@ class TeleopCoordinator(QObject):
             )
             master_follow_cont = prev_record_wrapped.copy()
 
-            # ---------- 人工介入检测初始化 ----------
-            # J1~J6 使用连续角；M7 使用实际工具电机位置（0~1rad附近）。
-            master_actual0 = self.master.get_dh_q()
-            tool7_actual0 = self.master.get_tool_position()
-            if master_actual0 is None or tool7_actual0 is None:
-                failure_reason = "人工介入检测初始化时主端1~7轴反馈丢失"
-                return
-            prev_master_actual_wrapped = np.asarray(master_actual0, dtype=float)
-            master_actual_cont = prev_master_actual_wrapped.copy()
-            prev_tool7_actual = float(tool7_actual0)
-            prev_tool7_ref = float(first_open)
+            # ---------- 独立人工介入检测器初始化 ----------
+            self._update_takeover_reference(
+                master_follow_cont.tolist(),
+                first_open,
+                master_ref_vel=[0.0] * ARM_DOF,
+                tool_ref_vel=0.0,
+                ref_vel_valid=False,
+            )
+            self._start_takeover_detector()
 
-            prev_detector_time = time.perf_counter()
-            takeover_stable_since: Optional[float] = None
-            takeover_fast_since: Optional[float] = None
-            takeover_slow_since: Optional[float] = None
-            takeover_opposite_since: Optional[float] = None
-            last_takeover_diag = 0.0
+            # 参考速度历史：用多帧窗口消除相邻时间戳过近造成的几十/上百 rad/s 假速度。
+            ref_vel_history = deque(maxlen=TAKEOVER_REF_VEL_WINDOW_FRAMES + 1)
+            master_ref_vel_filt = np.zeros(ARM_DOF, dtype=float)
+            tool_ref_vel_filt = 0.0
 
             replay_start = time.perf_counter()
             t0 = float(timestamp[0])
@@ -2327,6 +2615,61 @@ class TeleopCoordinator(QObject):
                 master_follow_cont += step
                 prev_record_wrapped = record_wrapped
 
+                # ---------- 稳健参考速度：多帧窗口 + 低通 + 合理性校验 ----------
+                # 不再使用相邻两帧 timestamp 直接相除；某两个记录时间戳若异常接近，
+                # 会产生几十甚至上百 rad/s 的假速度并导致人工介入误触发。
+                ref_vel_history.append(
+                    (
+                        float(timestamp[i]),
+                        master_follow_cont.copy(),
+                        float(g_cmd),
+                    )
+                )
+
+                ref_vel_valid = False
+                master_ref_vel = master_ref_vel_filt.copy()
+                tool_ref_vel = float(tool_ref_vel_filt)
+
+                if len(ref_vel_history) >= 2:
+                    t_now, q_now_ref, g_now_ref = ref_vel_history[-1]
+                    # 优先使用窗口最老样本；若总时间跨度仍太短，则暂不提供速度给Detector。
+                    t_old, q_old_ref, g_old_ref = ref_vel_history[0]
+                    dt_window = float(t_now - t_old)
+                    if dt_window >= TAKEOVER_REF_VEL_MIN_DT_S:
+                        raw_master_ref_vel = (
+                            np.asarray(q_now_ref, dtype=float)
+                            - np.asarray(q_old_ref, dtype=float)
+                        ) / dt_window
+                        raw_tool_ref_vel = (float(g_now_ref) - float(g_old_ref)) / dt_window
+
+                        raw_arm_max = float(np.max(np.abs(raw_master_ref_vel)))
+                        raw_tool_abs = abs(float(raw_tool_ref_vel))
+                        finite_ok = (
+                            np.all(np.isfinite(raw_master_ref_vel))
+                            and math.isfinite(float(raw_tool_ref_vel))
+                        )
+                        sanity_ok = (
+                            raw_arm_max <= TAKEOVER_REF_VEL_SANITY_MAX_RAD_S
+                            and raw_tool_abs <= TAKEOVER_TOOL_REF_VEL_SANITY_MAX_RAD_S
+                        )
+
+                        if finite_ok and sanity_ok:
+                            alpha_v = float(TAKEOVER_REF_VEL_ALPHA)
+                            master_ref_vel_filt = (
+                                master_ref_vel_filt
+                                + alpha_v * (raw_master_ref_vel - master_ref_vel_filt)
+                            )
+                            tool_ref_vel_filt = (
+                                tool_ref_vel_filt
+                                + alpha_v * (float(raw_tool_ref_vel) - tool_ref_vel_filt)
+                            )
+                            master_ref_vel = master_ref_vel_filt.copy()
+                            tool_ref_vel = float(tool_ref_vel_filt)
+                            ref_vel_valid = True
+                        else:
+                            # 位置参考仍然继续更新，但异常速度绝不参与人工介入判定。
+                            ref_vel_valid = False
+
                 # M7 同样直接跟随示教文件中的夹爪开度。真实夹爪反馈仍由
                 # GripperController 持续读取，用于状态显示和通信新鲜度检查。
                 if not self.master.update_mit_follow_target(
@@ -2336,252 +2679,21 @@ class TeleopCoordinator(QObject):
                     failure_reason = "更新主端MIT跟随目标失败"
                     break
 
-                # ---------- 人工介入检测：J1~J6 + M7 ----------
-                # 三条通道并行：FAST / OPPOSITE / SLOW。
-                # 任一通道满足自己的持续时间，就立刻抢占 REPLAY 控制权。
-                if self.takeover_enabled:
-                    q_master_now = self.master.get_dh_q()
-                    q7_now = self.master.get_tool_position()
-                    if q_master_now is None or q7_now is None:
-                        failure_reason = "人工介入检测期间主端1~7轴反馈丢失"
-                        break
+                # ---------- 更新独立 Detector 的共享参考 ----------
+                # Detector 以 200 Hz 独立读取达妙电机 Velocity，不再依赖本回放循环的 dt。
+                self._update_takeover_reference(
+                    master_follow_cont.tolist(),
+                    g_cmd,
+                    master_ref_vel=master_ref_vel.tolist(),
+                    tool_ref_vel=tool_ref_vel,
+                    ref_vel_valid=ref_vel_valid,
+                )
 
-                    now_det = time.perf_counter()
-                    det_dt = max(1e-3, now_det - prev_detector_time)
-                    prev_detector_time = now_det
-
-                    # ----- J1~J6 实际连续角与速度 -----
-                    q_master_wrapped = np.asarray(q_master_now, dtype=float)
-                    actual_step = np.asarray(
-                        [
-                            Robot.minor_arc_dir(float(a), float(b))
-                            for a, b in zip(
-                                prev_master_actual_wrapped, q_master_wrapped
-                            )
-                        ],
-                        dtype=float,
-                    )
-                    master_actual_cont += actual_step
-                    prev_master_actual_wrapped = q_master_wrapped
-
-                    actual_vel6 = actual_step / det_dt
-                    ref_vel6 = step / det_dt
-
-                    # ----- M7 实际位置、参考位置与速度 -----
-                    q7_actual = float(q7_now)
-                    q7_ref = float(g_cmd)  # 0~1 opening 与 M7 0~1rad 一一对应
-                    q7_actual_vel = (q7_actual - prev_tool7_actual) / det_dt
-                    q7_ref_vel = (q7_ref - prev_tool7_ref) / det_dt
-                    prev_tool7_actual = q7_actual
-                    prev_tool7_ref = q7_ref
-
-                    # 统一为 7 维向量，最后一维就是 M7。
-                    actual_pos7 = np.concatenate(
-                        [master_actual_cont, np.asarray([q7_actual], dtype=float)]
-                    )
-                    ref_pos7 = np.concatenate(
-                        [master_follow_cont, np.asarray([q7_ref], dtype=float)]
-                    )
-                    actual_vel7 = np.concatenate(
-                        [actual_vel6, np.asarray([q7_actual_vel], dtype=float)]
-                    )
-                    ref_vel7 = np.concatenate(
-                        [ref_vel6, np.asarray([q7_ref_vel], dtype=float)]
-                    )
-
-                    err_vec7 = actual_pos7 - ref_pos7
-                    rel_vel7 = actual_vel7 - ref_vel7
-                    abs_err7 = np.abs(err_vec7)
-                    max_arm_err = float(np.max(abs_err7[:ARM_DOF]))
-                    tool_err = float(abs_err7[ARM_DOF])
-
-                    # 武装阶段：1~6轴和M7都先进入合理跟随区，避免刚切MIT的瞬态。
-                    if not self.takeover_armed:
-                        arm_stable = max_arm_err <= TAKEOVER_ARM_ERROR_RAD
-                        tool_stable = tool_err <= TAKEOVER_TOOL_ARM_ERROR_RAD
-                        if arm_stable and tool_stable:
-                            if takeover_stable_since is None:
-                                takeover_stable_since = now_det
-                            elif (
-                                now_det - takeover_stable_since
-                                >= TAKEOVER_ARM_STABLE_TIME_S
-                            ):
-                                self.takeover_armed = True
-                                takeover_fast_since = None
-                                takeover_slow_since = None
-                                takeover_opposite_since = None
-                                self.log(
-                                    "[TAKEOVER] 人工介入检测已武装："
-                                    f"稳定跟随{TAKEOVER_ARM_STABLE_TIME_S:.2f}s，"
-                                    "检测J1~J6 + M7"
-                                )
-                        else:
-                            takeover_stable_since = None
-                    else:
-                        # ---------- 每个轴自己的阈值 ----------
-                        base_err = np.asarray(
-                            [TAKEOVER_BASE_ERROR_RAD] * ARM_DOF
-                            + [TAKEOVER_TOOL_BASE_ERROR_RAD],
-                            dtype=float,
-                        )
-                        speed_gain = np.asarray(
-                            [TAKEOVER_SPEED_GAIN_S] * ARM_DOF
-                            + [TAKEOVER_TOOL_SPEED_GAIN_S],
-                            dtype=float,
-                        )
-                        max_err_threshold = np.asarray(
-                            [TAKEOVER_MAX_ERROR_RAD] * ARM_DOF
-                            + [TAKEOVER_TOOL_MAX_ERROR_RAD],
-                            dtype=float,
-                        )
-                        min_actual_vel = np.asarray(
-                            [TAKEOVER_MIN_ACTUAL_VEL_RAD_S] * ARM_DOF
-                            + [TAKEOVER_TOOL_MIN_ACTUAL_VEL_RAD_S],
-                            dtype=float,
-                        )
-                        fast_err_threshold = np.asarray(
-                            [TAKEOVER_FAST_ERROR_RAD] * ARM_DOF
-                            + [TAKEOVER_TOOL_FAST_ERROR_RAD],
-                            dtype=float,
-                        )
-                        fast_actual_vel = np.asarray(
-                            [TAKEOVER_FAST_ACTUAL_VEL_RAD_S] * ARM_DOF
-                            + [TAKEOVER_TOOL_FAST_ACTUAL_VEL_RAD_S],
-                            dtype=float,
-                        )
-                        fast_rel_vel = np.asarray(
-                            [TAKEOVER_FAST_REL_VEL_RAD_S] * ARM_DOF
-                            + [TAKEOVER_TOOL_FAST_REL_VEL_RAD_S],
-                            dtype=float,
-                        )
-                        opposite_err_threshold = np.asarray(
-                            [TAKEOVER_OPPOSITE_ERROR_RAD] * ARM_DOF
-                            + [TAKEOVER_TOOL_OPPOSITE_ERROR_RAD],
-                            dtype=float,
-                        )
-                        opposite_actual_vel = np.asarray(
-                            [TAKEOVER_OPPOSITE_ACTUAL_VEL_RAD_S] * ARM_DOF
-                            + [TAKEOVER_TOOL_OPPOSITE_ACTUAL_VEL_RAD_S],
-                            dtype=float,
-                        )
-                        opposite_ref_vel = np.asarray(
-                            [TAKEOVER_OPPOSITE_REF_VEL_RAD_S] * ARM_DOF
-                            + [TAKEOVER_TOOL_OPPOSITE_REF_VEL_RAD_S],
-                            dtype=float,
-                        )
-
-                        dynamic_threshold = np.minimum(
-                            max_err_threshold,
-                            base_err + speed_gain * np.abs(ref_vel7),
-                        )
-
-                        # 主端自身实际运动正在把误差推大。
-                        # 这比 err * relative_velocity 更能排除“参考跑得快而主端只是滞后”。
-                        actual_worsening = (
-                            (err_vec7 * actual_vel7) > 0.0
-                        ) & (np.abs(actual_vel7) >= min_actual_vel)
-
-                        # FAST：快速、短促地推动主端。除了相对速度大，还要求
-                        # 主端自身实际速度也大，避免仅因参考轨迹瞬间变化而误触发。
-                        fast_mask = (
-                            (abs_err7 >= fast_err_threshold)
-                            & (np.abs(actual_vel7) >= fast_actual_vel)
-                            & (np.abs(rel_vel7) >= fast_rel_vel)
-                            & ((err_vec7 * actual_vel7) > 0.0)
-                        )
-
-                        # OPPOSITE：实际主端速度与回放参考速度方向明显相反。
-                        opposite_mask = (
-                            (abs_err7 >= opposite_err_threshold)
-                            & (actual_vel7 * ref_vel7 < 0.0)
-                            & (np.abs(actual_vel7) >= opposite_actual_vel)
-                            & (np.abs(ref_vel7) >= opposite_ref_vel)
-                        )
-
-                        # SLOW：慢速、持续地由主端自身运动扩大误差。
-                        slow_mask = (
-                            (abs_err7 >= dynamic_threshold)
-                            & actual_worsening
-                        )
-
-                        trigger_kind: Optional[str] = None
-                        trigger_mask: Optional[np.ndarray] = None
-
-                        if bool(np.any(fast_mask)):
-                            if takeover_fast_since is None:
-                                takeover_fast_since = now_det
-                            elif (
-                                now_det - takeover_fast_since
-                                >= TAKEOVER_FAST_PERSIST_S
-                            ):
-                                trigger_kind = "FAST"
-                                trigger_mask = fast_mask
-                        else:
-                            takeover_fast_since = None
-
-                        if trigger_kind is None:
-                            if bool(np.any(opposite_mask)):
-                                if takeover_opposite_since is None:
-                                    takeover_opposite_since = now_det
-                                elif (
-                                    now_det - takeover_opposite_since
-                                    >= TAKEOVER_OPPOSITE_PERSIST_S
-                                ):
-                                    trigger_kind = "OPPOSITE"
-                                    trigger_mask = opposite_mask
-                            else:
-                                takeover_opposite_since = None
-
-                        if trigger_kind is None:
-                            if bool(np.any(slow_mask)):
-                                if takeover_slow_since is None:
-                                    takeover_slow_since = now_det
-                                elif (
-                                    now_det - takeover_slow_since
-                                    >= TAKEOVER_PERSIST_S
-                                ):
-                                    trigger_kind = "SLOW"
-                                    trigger_mask = slow_mask
-                            else:
-                                takeover_slow_since = None
-
-                        if trigger_kind is not None and trigger_mask is not None:
-                            axes = np.where(trigger_mask)[0]
-                            # 优先报告绝对误差最大的触发轴。
-                            axis = int(axes[np.argmax(abs_err7[axes])])
-                            axis_name = f"J{axis + 1}" if axis < ARM_DOF else "M7"
-
-                            self.takeover_triggered = True
-                            takeover_triggered = True
-                            self.takeover_event.set()
-                            self._set_control_mode(ControlMode.TAKEOVER)
-                            self.takeover_last_reason = (
-                                f"{trigger_kind} {axis_name}: "
-                                f"err={err_vec7[axis]:.3f}rad, "
-                                f"actual_vel={actual_vel7[axis]:.3f}rad/s, "
-                                f"ref_vel={ref_vel7[axis]:.3f}rad/s, "
-                                f"rel_vel={rel_vel7[axis]:.3f}rad/s"
-                            )
-                            self.log(
-                                "[TAKEOVER] 检测到人工介入："
-                                + self.takeover_last_reason
-                            )
-                            break
-
-                        # 低频诊断：同时显示6轴最大误差与M7误差，便于现场调参。
-                        if now_det - last_takeover_diag >= 0.75:
-                            last_takeover_diag = now_det
-                            self.log(
-                                "[TAKEOVER] armed | "
-                                f"arm_max_err={max_arm_err:.3f}rad | "
-                                f"M7_err={tool_err:.3f}rad | "
-                                f"slow_thr_max={float(np.max(dynamic_threshold[:ARM_DOF])):.3f}rad | "
-                                f"M7_thr={float(dynamic_threshold[ARM_DOF]):.3f}rad"
-                            )
 
         except Exception as e:
             failure_reason = f"示教回放线程异常: {e}"
         finally:
+            self._stop_takeover_detector()
             # ========================================================
             # 回放退出路径必须区分：人工抢占 vs 普通结束/停止/故障。
             # TAKEOVER 路径绝不能 servoStop、不能切PV，否则会打断新遥操作。
@@ -2600,9 +2712,21 @@ class TeleopCoordinator(QObject):
                     except Exception:
                         pass
 
-                if not self._start_takeover_teleop_from_current():
-                    failure_reason = "人工介入已触发，但切换实时遥操作失败"
-                    # 只有交接失败才执行安全停止和PV保持。
+                takeover_ok = False
+                try:
+                    takeover_ok = bool(self._start_takeover_teleop_from_current())
+                except Exception as e:
+                    failure_reason = f"人工接管交接异常: {e}"
+                    self.log(f"[ERR] {failure_reason}")
+                    takeover_ok = False
+
+                if not takeover_ok:
+                    if failure_reason is None:
+                        failure_reason = "人工介入已触发，但切换实时遥操作失败"
+                    # 只有交接失败才执行安全停止和PV保持；同时强制退出
+                    # TAKEOVER 中间态，避免主端自由而 UR5e 无控制源。
+                    self.teleop_stop_event.set()
+                    self.teleop_running = False
                     self.ur.stop_j()
                     self.ur.servo_stop()
                     self._set_control_mode(ControlMode.IDLE)
@@ -2631,7 +2755,7 @@ class TeleopCoordinator(QObject):
             if failure_reason:
                 self.log(f"[SAFE] {failure_reason}，示教回放停止")
                 self.state_signal.emit("示教回放异常停止")
-            elif takeover_triggered:
+            elif takeover_triggered or self.takeover_triggered:
                 # 成功接管时 _start_takeover_teleop_from_current() 已更新状态。
                 pass
             elif self.replay_stop_event.is_set():
@@ -2686,6 +2810,7 @@ class TeleopCoordinator(QObject):
         return False
 
     def cleanup(self):
+        self._stop_takeover_detector()
         if self.recording:
             try:
                 self.stop_recording(save=True)
